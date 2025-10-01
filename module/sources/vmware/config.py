@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2023 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2025 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -17,7 +17,7 @@ from module.config.option import ConfigOption
 from module.config.group import ConfigOptionGroup
 from module.sources.common.config import *
 from module.sources.common.permitted_subnets import PermittedSubnets
-from module.sources.common.excluded_vlan import ExcludedVLANID, ExcludedVLANName
+from module.sources.common.handle_vlan import FilterVLANByID, FilterVLANByName
 from module.common.logging import get_logger
 from module.common.support import normalize_mac_address
 
@@ -108,6 +108,15 @@ class VMWareConfig(ConfigBase):
                                              str, description="simply include/exclude VMs"),
                                 ConfigOption("vm_include_filter", str)
                               ]),
+            ConfigOption("vm_exclude_by_tag_filter",
+                         str,
+                         description="""defines a comma separated list of vCenter tags which (if assigned to a VM)
+                         will exclude this VM from being synced to NetBox. The config option 'vm_tag_source'
+                         determines which tags are collected for VMs.
+                         """,
+                         config_example="tag-a, tag-b"
+                         ),
+
             ConfigOptionGroup(title="relations",
                               options=[
                                 ConfigOption("cluster_site_relation",
@@ -147,15 +156,16 @@ class VMWareConfig(ConfigBase):
                                              config_example="Cluster_NYC.* = Customer A"),
                                 ConfigOption("host_tenant_relation", str, config_example="esxi300.* = Infrastructure"),
                                 ConfigOption("vm_tenant_relation", str, config_example="grafana.* = Infrastructure"),
-                                ConfigOption("vm_platform_relation",
+                                ConfigOption("host_platform_relation",
                                              str,
                                              description="""\
                                              This option defines custom platforms if the VMWare created platforms are not suitable.
                                              Pretty much a mapping of VMWare platform name to your own platform name.
                                              This is done with a comma separated key = value list.
-                                               key: defines a VMWare returned platform name
+                                               key: defines a VMWare returned platform name as regex
                                                value: defines the desired NetBox platform name""",
-                                             config_example="centos-7.* = centos7, microsoft-windows-server-2016.* = Windows2016"),
+                                             config_example="VMware ESXi 7.0.3 = VMware ESXi 7.0 Update 3o"),
+                                ConfigOption("vm_platform_relation", str, config_example="centos-7.* = centos7, microsoft-windows-server-2016.* = Windows2016"),
                                 ConfigOption("host_role_relation",
                                              str,
                                              description="""\
@@ -195,6 +205,10 @@ class VMWareConfig(ConfigBase):
             ConfigOption("collect_hardware_asset_tag",
                          bool,
                          description="Attempt to collect asset tags from vCenter hosts",
+                         default_value=True),
+            ConfigOption("collect_hardware_serial",
+                         bool,
+                         description="Attempt to collect serials from vCenter hosts",
                          default_value=True),
             ConfigOption("dns_name_lookup",
                          bool,
@@ -320,7 +334,27 @@ class VMWareConfig(ConfigBase):
                                   ConfigOption("vlan_sync_exclude_by_id",
                                                str,
                                                config_example="Frankfurt/25, 1023-1042"),
+                                  ConfigOption("vlan_group_relation_by_name",
+                                               str,
+                                               description="""adds a relation to assign VLAN groups to matching VLANs
+                                               by name. Same matching rules as the exclude_by_name option uses are applied.
+                                               If name and id relations are defined, the name relation takes precedence.
+                                               Fist match wins. Only newly discovered VLANs which are not present in
+                                               NetBox will be assigned a VLAN group. Supported scopes for a VLAN group
+                                               are "site", "site-group", "cluster" and "cluster-group". Scopes are buggy
+                                               in NetBox https://github.com/netbox-community/netbox/issues/18706
+                                               """,
+                                               config_example="London/Vlan_.* = VLAN Group 1, Tokio/Vlan_.* = VLAN Group 2"),
+                                  ConfigOption("vlan_group_relation_by_id",
+                                               str,
+                                               description="""adds a relation to assign VLAN groups to matching VLANs by ID.
+                                               Same matching rules as the exclude_by_id option uses are applied.
+                                               Fist match wins.  Only newly discovered VLANs which are not present in
+                                               NetBox will be assigned a VLAN group.
+                                               """,
+                                               config_example="1023-1042 = VLAN Group 1, Tokio/2342 = VLAN Group 2")
                               ]),
+
             ConfigOption("track_vm_host",
                          bool,
                          description="""enabling this option will add the ESXi host
@@ -373,6 +407,14 @@ class VMWareConfig(ConfigBase):
                          """,
                          config_example="VB_LAST_BACKUP, VB_LAST_BACKUP2"
                          ),
+            ConfigOption("vm_disk_and_ram_in_decimal",
+                         bool,
+                         description="""In NetBox version 4.1.0 and newer the VM disk and RAM values are displayed
+                         in power of 10 instead of power of 2. If this values is set to true 4GB of RAM will be
+                         set to a value of 4000 megabyte. If set to false 4GB of RAM will be reported as 4096MB.
+                         The same behavior also applies for VM disk sizes.""",
+                         default_value=True
+                         ),
 
             # removed settings
             ConfigOption("netbox_host_device_role",
@@ -408,7 +450,7 @@ class VMWareConfig(ConfigBase):
             if option.value is None:
                 continue
 
-            if "filter" in option.key:
+            if "filter" in option.key and "vm_exclude_by_tag_filter" not in option.key:
 
                 re_compiled = None
                 try:
@@ -421,7 +463,13 @@ class VMWareConfig(ConfigBase):
 
                 continue
 
-            if "relation" in option.key:
+            if option.key == "vm_exclude_by_tag_filter":
+
+                option.set_value(quoted_split(option.value))
+
+                continue
+
+            if "relation" in option.key and "vlan_group_relation" not in option.key:
 
                 relation_data = list()
 
@@ -540,35 +588,57 @@ class VMWareConfig(ConfigBase):
 
                 continue
 
-            if option.key == "vlan_sync_exclude_by_name":
+            if option.key in [ "vlan_sync_exclude_by_name", "vlan_sync_exclude_by_id",
+                               "vlan_group_relation_by_name", "vlan_group_relation_by_id" ]:
+
+                if option.key == "vlan_sync_exclude_by_name":
+                    filter_class = FilterVLANByName
+                    filter_type = "exclude"
+                elif option.key == "vlan_group_relation_by_name":
+                    filter_class = FilterVLANByName
+                    filter_type = "group relation"
+                elif option.key == "vlan_sync_exclude_by_id":
+                    filter_class = FilterVLANByID
+                    filter_type = "exclude"
+                elif option.key == "vlan_group_relation_by_id":
+                    filter_class = FilterVLANByID
+                    filter_type = "group relation"
+                else:
+                    raise ValueError(f"unhandled config option {option.key}")
 
                 value_list = list()
 
-                for excluded_vlan in quoted_split(option.value) or list():
+                for single_option_value in quoted_split(option.value) or list():
 
-                    excluded_vlan_object = ExcludedVLANName(excluded_vlan)
+                    relation_name = None
+                    object_name = single_option_value.split("=")[0].strip(' "')
 
-                    if not excluded_vlan_object.is_valid():
+                    if "relation" in option.key:
+
+                        if "=" not in single_option_value:
+                            log.error(f"Config option '{option.key}' malformed, got {single_option_value} but "
+                                      f"needs key = value relation.")
+                            self.set_validation_failed()
+                            continue
+
+                        relation_name = single_option_value.split("=")[1].strip(' "')
+
+                        if relation_name is not None and len(relation_name) == 0:
+                            log.error(f"Config option '{option.key}' malformed, got '{object_name}' as "
+                                      f"object name and relation name was empty.")
+                            self.set_validation_failed()
+                            continue
+
+                    vlan_filter = filter_class(object_name, filter_type)
+
+                    if not vlan_filter.is_valid():
                         self.set_validation_failed()
                         continue
 
-                    value_list.append(excluded_vlan_object)
-
-                option.set_value(value_list)
-
-            if option.key == "vlan_sync_exclude_by_id":
-
-                value_list = list()
-
-                for excluded_vlan in quoted_split(option.value) or list():
-
-                    excluded_vlan_object = ExcludedVLANID(excluded_vlan)
-
-                    if not excluded_vlan_object.is_valid():
-                        self.set_validation_failed()
-                        continue
-
-                    value_list.append(excluded_vlan_object)
+                    if "relation" in option.key:
+                        value_list.append((vlan_filter, relation_name))
+                    else:
+                        value_list.append(vlan_filter)
 
                 option.set_value(value_list)
 

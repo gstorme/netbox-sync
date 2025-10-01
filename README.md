@@ -1,6 +1,9 @@
 
 # NetBox-Sync
 
+> [!CAUTION]
+> **Maintainer wanted - sunsetting this repository by 31.10.2025 [#474](https://github.com/bb-Ricardo/netbox-sync/issues/474)**
+
 This is a tool to sync data from different sources to a NetBox instance.
 
 Available source types:
@@ -99,7 +102,7 @@ usage: netbox-sync.py [-h] [-c settings.ini [settings.ini ...]] [-g]
 
 Sync objects from various sources to NetBox
 
-Version: 1.6.1 (2024-05-14)
+Version: 1.8.0 (2025-03-07)
 Project URL: https://github.com/bb-ricardo/netbox-sync
 
 options:
